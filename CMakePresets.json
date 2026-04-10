@@ -1,0 +1,35 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "macos-x86_64-reference-player",
+      "displayName": "macOS x86_64 Reference Player",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cmake-x86_64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "/opt/homebrew/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "/opt/homebrew/opt/llvm/bin/clang++",
+        "CMAKE_OSX_ARCHITECTURES": "x86_64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "10.12",
+        "GLAZE_SOURCE_DIR": "",
+        "GST_HOME_AUDIO_SOURCE_DIR": ""
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "macos-x86_64-reference-player",
+      "configurePreset": "macos-x86_64-reference-player",
+      "targets": [
+        "dlboamdmod",
+        "prepare_reference_player_plugins"
+      ]
+    }
+  ]
+}
