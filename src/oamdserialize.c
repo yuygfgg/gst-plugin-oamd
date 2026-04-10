@@ -13,6 +13,7 @@ struct _DlbOAMDSerialize {
     GstAudioInfo audio_info;
     gboolean have_audio_info;
     gboolean src_caps_sent;
+    gboolean have_next_sample_pos;
     guint64 next_sample_pos;
     OAMDSerializerState *serializer;
 };
@@ -40,6 +41,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
 static void dlb_oamd_serialize_reset_state(DlbOAMDSerialize *self) {
     self->have_audio_info = FALSE;
     self->src_caps_sent = FALSE;
+    self->have_next_sample_pos = FALSE;
     self->next_sample_pos = 0;
     gst_audio_info_init(&self->audio_info);
 
@@ -66,6 +68,11 @@ static guint64 dlb_oamd_serialize_get_base_sample_pos(DlbOAMDSerialize *self,
                                                       GstBuffer *buffer) {
     if (GST_BUFFER_OFFSET_IS_VALID(buffer))
         return GST_BUFFER_OFFSET(buffer);
+
+    if (self->have_next_sample_pos &&
+        !GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT)) {
+        return self->next_sample_pos;
+    }
 
     if (GST_BUFFER_PTS_IS_VALID(buffer) && self->have_audio_info &&
         GST_AUDIO_INFO_RATE(&self->audio_info) > 0) {
@@ -217,6 +224,7 @@ static GstFlowReturn dlb_oamd_serialize_chain(GstPad *pad, GstObject *parent,
 
     buffer_samples = dlb_oamd_serialize_get_buffer_samples(self, buffer);
     self->next_sample_pos = base_sample_pos + buffer_samples;
+    self->have_next_sample_pos = TRUE;
 
     g_ptr_array_free(ctx.metas, TRUE);
     gst_buffer_unref(buffer);
