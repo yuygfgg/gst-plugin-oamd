@@ -5,7 +5,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,13 +16,40 @@
 #include "glaze/yaml.hpp"
 
 namespace {
-constexpr std::array<uint8_t, 6> kISFCountList = {4, 8, 10, 14, 15, 30};
-constexpr std::array<uint16_t, 16> kRampDurationList = {
+
+constexpr gsize kMaxObjectCount = 159;
+constexpr gint8 kGainMinusInfinity = -128;
+constexpr std::array<guint8, 6> kISFCountList = {4, 8, 10, 14, 15, 30};
+constexpr std::array<guint16, 16> kRampDurationList = {
     32,   64,   128,  256,  320,  480,  1000, 1001,
     1024, 1600, 1601, 1602, 1920, 2000, 2002, 2048,
 };
-
-template <typename T> using Result = std::expected<T, std::string>;
+constexpr std::array<double, 16> kTrimLut = {
+    6.0,  3.0,  1.5,  0.75,  -0.75, -1.5,  -3.0,  -4.5,
+    -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -16.0, -36.0,
+};
+constexpr std::array<double, 4> kObjectDivTableTable = {
+    0.500755,
+    0.608529,
+    0.704833,
+    1.0,
+};
+constexpr std::array<std::optional<double>, 64> kObjectDivCodeTable = {
+    std::nullopt, 0.0,      0.004026, 0.00716,  0.012731, 0.020173, 0.028485,
+    0.04021,      0.050582, 0.063601, 0.079914, 0.100299, 0.125666, 0.140532,
+    0.157027,     0.175282, 0.195417, 0.217536, 0.241718, 0.268002, 0.296377,
+    0.326766,     0.359017, 0.392895, 0.428081, 0.464184, 0.500755, 0.537316,
+    0.573389,     0.608529, 0.642346, 0.674524, 0.704833, 0.733123, 0.75932,
+    0.783416,     0.805451, 0.825506, 0.843686, 0.860112, 0.874914, 0.888222,
+    0.900168,     0.910875, 0.920461, 0.929035, 0.936698, 0.943544, 0.949656,
+    0.955112,     0.95998,  0.964322, 0.968195, 0.974729, 0.979923, 0.98405,
+    0.98733,      0.989935, 0.992874, 0.994955, 0.996817, 0.99821,  0.998993,
+    1.0,
+};
+constexpr std::array<double, 4> kExtPrecPos3DLut = {1.0, 2.0, -1.0, -2.0};
+constexpr std::array<std::string_view, 6> kZoneLabels = {
+    "all", "no back", "no sides", "center back", "screen only", "surround only",
+};
 
 struct BitReader {
     const guint8* data = nullptr;
@@ -39,7 +65,6 @@ struct BitReader {
 
     template <typename T> bool get_n(guint32 n, T& out, std::string& error) {
         guint64 value = 0;
-        guint64 i;
 
         if (n > 64) {
             error = "requested bit width is too large";
@@ -51,10 +76,10 @@ struct BitReader {
             return false;
         }
 
-        for (i = 0; i < n; i++) {
+        for (guint32 i = 0; i < n; ++i) {
             const guint64 pos = bit_pos + i;
             const guint8 byte = data[pos / 8];
-            const guint8 bit = (byte >> (7 - (pos % 8))) & 1;
+            const guint8 bit = (byte >> (7 - (pos % 8))) & 1U;
             value = (value << 1) | bit;
         }
 
@@ -73,7 +98,7 @@ struct BitReader {
         return true;
     }
 
-    bool skip_n(guint32 n, std::string& error) {
+    bool skip_n(guint64 n, std::string& error) {
         if (bit_pos + n > total_bits) {
             error = "unexpected end of OAMD payload";
             return false;
@@ -114,7 +139,7 @@ static bool get_variable_bits_max(BitReader& reader, guint32 n,
 static bool get_sn(BitReader& reader, guint32 n, gint64& out,
                    std::string& error) {
     gint64 value = 0;
-    gint64 sign = 0;
+    const gint64 sign = gint64(1) << (n - 1);
 
     if (n == 0 || n > 62) {
         error = "invalid signed bit width";
@@ -124,7 +149,6 @@ static bool get_sn(BitReader& reader, guint32 n, gint64& out,
     if (!reader.get_n(n, value, error))
         return false;
 
-    sign = gint64(1) << (n - 1);
     out = (value ^ sign) - sign;
     return true;
 }
@@ -134,10 +158,37 @@ struct BedAssignment {
 
     static BedAssignment from_non_std(guint32 value) {
         BedAssignment ret;
-        guint32 i;
 
-        for (i = 0; i < ret.channels.size(); i++)
+        for (gsize i = 0; i < ret.channels.size(); ++i)
             ret.channels[i] = ((value >> i) & 1U) != 0;
+
+        return ret;
+    }
+
+    static BedAssignment from_std(guint16 value) {
+        static constexpr std::array<std::array<guint8, 2>, 10> kStdBedList = {{
+            {{0, 1}},
+            {{2, 0xff}},
+            {{3, 0xff}},
+            {{4, 5}},
+            {{6, 7}},
+            {{8, 9}},
+            {{10, 11}},
+            {{12, 13}},
+            {{14, 15}},
+            {{16, 0xff}},
+        }};
+
+        BedAssignment ret;
+
+        for (gsize i = 0; i < kStdBedList.size(); ++i) {
+            if (((value >> i) & 1U) == 0)
+                continue;
+
+            ret.channels[kStdBedList[i][0]] = true;
+            if (kStdBedList[i][1] != 0xff)
+                ret.channels[kStdBedList[i][1]] = true;
+        }
 
         return ret;
     }
@@ -148,96 +199,63 @@ struct BedAssignment {
         return ret;
     }
 
-    static BedAssignment from_std(guint16 value) {
-        BedAssignment ret;
-        auto set_pair = [&ret](guint32 a, guint32 b) {
-            ret.channels[a] = true;
-            ret.channels[b] = true;
-        };
-
-        if ((value >> 0) & 1U)
-            set_pair(0, 1);
-        if ((value >> 1) & 1U)
-            ret.channels[2] = true;
-        if ((value >> 2) & 1U)
-            ret.channels[3] = true;
-        if ((value >> 3) & 1U)
-            set_pair(4, 5);
-        if ((value >> 4) & 1U)
-            set_pair(6, 7);
-        if ((value >> 5) & 1U)
-            set_pair(8, 9);
-        if ((value >> 6) & 1U)
-            set_pair(10, 11);
-        if ((value >> 7) & 1U)
-            set_pair(12, 13);
-        if ((value >> 8) & 1U)
-            set_pair(14, 15);
-        if ((value >> 9) & 1U)
-            ret.channels[16] = true;
-
-        return ret;
+    gsize count_beds() const {
+        return static_cast<gsize>(
+            std::count(channels.begin(), channels.end(), true));
     }
 
-    guint8 count_beds() const {
-        return static_cast<guint8>(
-            std::count(channels.begin(), channels.end(), true));
+    std::vector<gsize> to_index_vec() const {
+        std::vector<gsize> out;
+
+        out.reserve(count_beds());
+        for (gsize i = 0; i < channels.size(); ++i) {
+            if (channels[i])
+                out.push_back(i);
+        }
+
+        return out;
     }
 };
 
 struct ProgramAssignment {
     bool b_dyn_object_only_program = false;
-    bool b_lfe_present = false;
-    guint8 content_description = 0;
     bool b_bed_chan_distribute = false;
-    guint8 intermediate_spatial_format_idx = 0;
-    guint8 num_dynamic_objects = 0;
     std::vector<BedAssignment> bed_assignment{};
-    guint8 beds_or_isf_count = 0;
+    gsize num_bed_objects = 0;
+    gsize num_isf_objects = 0;
+    gsize num_dynamic_objects = 0;
+
+    gsize beds_or_isf_count() const {
+        return num_bed_objects + num_isf_objects;
+    }
 };
 
 struct ObjectBasicInfo {
-    guint8 object_gain_idx = 0;
-    guint8 object_gain_bits = 0;
-    bool b_default_object_priority = false;
-    guint8 object_priority_bits = 0;
+    gint8 object_gain = kGainMinusInfinity;
     double object_priority = 0.0;
+
+    std::string gain_string() const {
+        if (object_gain == kGainMinusInfinity)
+            return "-inf";
+
+        return std::to_string(object_gain);
+    }
 };
 
 struct ObjectRenderInfo {
     bool b_differential_position_specified = false;
-    double pos3d_x = 0.0;
-    double pos3d_y = 0.0;
-    double pos3d_z = 0.0;
+    std::array<double, 3> pos3d{0.5, 0.5, 0.0};
     bool b_object_distance_specified = false;
     bool b_object_at_infinity = false;
     guint8 distance_factor_idx = 0;
     guint8 zone_constraints_idx = 0;
-    bool b_enable_elevation = false;
-    guint8 object_size_idx = 0;
-    guint8 object_size_bits = 0;
-    guint8 object_width_bits = 0;
-    guint8 object_depth_bits = 0;
-    guint8 object_height_bits = 0;
+    bool b_enable_elevation = true;
+    std::array<double, 3> object_size{0.0, 0.0, 0.0};
+    bool b_has_size3d = false;
     bool b_object_use_screen_ref = false;
-    guint8 screen_factor_bits = 0;
-    guint8 depth_factor_idx = 0;
+    double screen_factor = 0.0;
+    double depth_factor = 0.25;
     bool b_object_snap = false;
-};
-
-struct ObjectInfoBlock {
-    bool b_object_not_active = false;
-    guint8 object_basic_info_status_idx = 0;
-    std::optional<ObjectBasicInfo> object_basic_info{};
-    bool b_object_in_bed_or_isf = false;
-    guint8 object_render_info_status_idx = 0;
-    std::optional<ObjectRenderInfo> object_render_info{};
-    bool b_additional_table_data_exists = false;
-    guint32 additional_table_data_size_bits = 0;
-};
-
-struct ObjectData {
-    std::vector<ObjectInfoBlock> object_info_block{};
 };
 
 struct BlockUpdateInfo {
@@ -247,16 +265,84 @@ struct BlockUpdateInfo {
 };
 
 struct MDUpdateInfo {
-    guint8 sample_offset_code = 0;
-    guint8 sample_offset = 0;
-    guint8 num_obj_info_blocks = 0;
+    gsize sample_offset = 0;
+    gsize num_obj_info_blocks = 0;
     std::vector<BlockUpdateInfo> block_update_info{};
 };
+
+struct ObjectInfoBlock {
+    bool b_object_not_active = false;
+    guint8 object_basic_info_status_idx = 0;
+    bool has_object_basic_info = false;
+    ObjectBasicInfo object_basic_info{};
+    bool b_object_in_bed_or_isf = false;
+    guint8 object_render_info_status_idx = 0;
+    bool has_object_render_info = false;
+    ObjectRenderInfo object_render_info{};
+    bool b_additional_table_data_exists = false;
+    guint32 additional_table_data_size_bits = 0;
+};
+
+using ObjectData = std::vector<ObjectInfoBlock>;
 
 struct ObjectElement {
     MDUpdateInfo md_update_info{};
     bool b_reserved_data_not_present = false;
+    guint8 reserved_data = 32;
     std::vector<ObjectData> object_data{};
+};
+
+struct Trim {
+    bool b_default_trim = true;
+    bool b_disable_trim = false;
+    std::optional<double> trim_centre{};
+    std::optional<double> trim_surround{};
+    std::optional<double> trim_height{};
+    std::optional<double> bal3d_y_tb{};
+    std::optional<double> bal3d_y_lis{};
+};
+
+struct TrimElement {
+    guint8 warp_mode = 0;
+    guint8 reserved = 0;
+    guint8 global_trim_mode = 0;
+    std::array<std::optional<Trim>, 9> trims{};
+    bool b_disable_trim_per_obj = false;
+    std::vector<bool> b_disable_trim{};
+};
+
+struct ObjectDivergenceBlock {
+    double object_divergence = 0.0;
+    bool b_object_divergence = false;
+    guint8 object_div_mode = 0;
+    guint8 object_div_table = 0;
+    guint8 object_div_code = 0;
+};
+
+struct ExtendedPrecisionPositionBlock {
+    double ext_prec_pos3d_x = 0.0;
+    double ext_prec_pos3d_y = 0.0;
+    double ext_prec_pos3d_z = 0.0;
+};
+
+struct ExtendedObjectElement {
+    bool b_obj_div_block = false;
+    std::vector<std::vector<ObjectDivergenceBlock>> object_div_block{};
+    bool b_ext_prec_pos_block = false;
+    std::vector<std::vector<ExtendedPrecisionPositionBlock>>
+        ext_prec_pos_block{};
+};
+
+struct OAMDParserState {
+    gsize object_count = 0;
+    ProgramAssignment program_assignment{};
+    bool b_alternate_object_data_present = false;
+    std::array<gint8, kMaxObjectCount> prev_object_gain{};
+    ObjectBasicInfo prev_object_basic_info{};
+    ObjectRenderInfo prev_object_render_info{};
+    std::optional<ObjectElement> object_element{};
+    std::optional<TrimElement> trim_element{};
+    std::optional<ExtendedObjectElement> extended_object_element{};
 };
 
 struct OAElementMD {
@@ -264,31 +350,101 @@ struct OAElementMD {
     guint64 oa_element_size_bits = 0;
     std::optional<guint8> alternate_object_data_id_idx{};
     bool b_discard_unknown_element = false;
-    std::optional<ObjectElement> object_element{};
 };
 
 struct ObjectAudioMetadataPayload {
-    guint8 oa_md_version_bits = 0;
-    guint8 object_count = 0;
+    guint64 evo_sample_offset = 0;
+    guint8 oamd_version = 0;
+    gsize object_count = 0;
     ProgramAssignment program_assignment{};
     bool b_alternate_object_data_present = false;
+    std::optional<ObjectElement> object_element{};
+    std::optional<TrimElement> trim_element{};
+    std::optional<ExtendedObjectElement> extended_object_element{};
     std::vector<OAElementMD> oa_element_md{};
+
+    std::vector<std::vector<std::array<double, 3>>> get_damf_pos() const {
+        std::vector<std::vector<std::array<double, 3>>> damf_pos(object_count);
+
+        if (object_element.has_value()) {
+            for (gsize object_index = 0; object_index < object_count;
+                 ++object_index) {
+                if (object_index >= object_element->object_data.size())
+                    continue;
+
+                const auto& object_blocks =
+                    object_element->object_data[object_index];
+
+                damf_pos[object_index].reserve(object_blocks.size());
+                for (const auto& block : object_blocks)
+                    damf_pos[object_index].push_back(
+                        block.object_render_info.pos3d);
+            }
+        }
+
+        if (extended_object_element.has_value()) {
+            for (gsize object_index = 0;
+                 object_index <
+                 std::min(object_count,
+                          extended_object_element->ext_prec_pos_block.size());
+                 ++object_index) {
+                auto& pos_blocks = damf_pos[object_index];
+                const auto& ext_blocks =
+                    extended_object_element->ext_prec_pos_block[object_index];
+
+                for (gsize block_index = 0;
+                     block_index <
+                     std::min(pos_blocks.size(), ext_blocks.size());
+                     ++block_index) {
+                    pos_blocks[block_index][0] +=
+                        ext_blocks[block_index].ext_prec_pos3d_x;
+                    pos_blocks[block_index][1] +=
+                        ext_blocks[block_index].ext_prec_pos3d_y;
+                    pos_blocks[block_index][2] +=
+                        ext_blocks[block_index].ext_prec_pos3d_z;
+                }
+            }
+        }
+
+        for (auto& pos_blocks : damf_pos) {
+            for (auto& pos3d : pos_blocks) {
+                pos3d[0] = (std::clamp(pos3d[0], 0.0, 1.0) - 0.5) * 2.0;
+                pos3d[1] = (0.5 - std::clamp(pos3d[1], 0.0, 1.0)) * 2.0;
+                pos3d[2] = std::clamp(pos3d[2], -1.0, 1.0);
+            }
+        }
+
+        return damf_pos;
+    }
 };
 
-static bool parse_program_assignment(BitReader& reader, ProgramAssignment& prog,
+static bool parse_program_assignment(BitReader& reader, OAMDParserState& state,
                                      std::string& error) {
+    auto& prog = state.program_assignment;
+
     if (!reader.get(prog.b_dyn_object_only_program, error))
         return false;
 
     if (prog.b_dyn_object_only_program) {
-        if (!reader.get(prog.b_lfe_present, error))
-            return false;
-        prog.bed_assignment.push_back(BedAssignment::with_lfe_only());
-    } else {
-        if (!reader.get_n(4, prog.content_description, error))
+        prog.num_dynamic_objects = state.object_count;
+
+        bool b_lfe_present = false;
+
+        if (!reader.get(b_lfe_present, error))
             return false;
 
-        if (prog.content_description & 1U) {
+        if (b_lfe_present) {
+            prog.bed_assignment.push_back(BedAssignment::with_lfe_only());
+            if (prog.num_dynamic_objects > 0)
+                prog.num_dynamic_objects -= 1;
+        }
+    } else {
+        guint8 content_description = 0;
+
+        if (!reader.get_n(4, content_description, error))
+            return false;
+
+        if ((content_description & 1U) != 0) {
             bool multiple_instances = false;
             guint8 num_bed_instances = 1;
 
@@ -298,17 +454,17 @@ static bool parse_program_assignment(BitReader& reader, ProgramAssignment& prog,
                 return false;
 
             if (multiple_instances) {
-                guint8 bits3 = 0;
-                if (!reader.get_n(3, bits3, error))
+                guint8 num_bed_instances_bits = 0;
+
+                if (!reader.get_n(3, num_bed_instances_bits, error))
                     return false;
-                num_bed_instances = bits3 + 2;
+
+                num_bed_instances =
+                    static_cast<guint8>(num_bed_instances_bits + 2);
             }
 
-            for (guint8 i = 0; i < num_bed_instances; i++) {
+            for (guint8 i = 0; i < num_bed_instances; ++i) {
                 bool b_lfe_only = false;
-                bool b_standard_chan_assign = false;
-                guint16 std_value = 0;
-                guint32 non_std_value = 0;
 
                 if (!reader.get(b_lfe_only, error))
                     return false;
@@ -319,37 +475,47 @@ static bool parse_program_assignment(BitReader& reader, ProgramAssignment& prog,
                     continue;
                 }
 
+                bool b_standard_chan_assign = false;
+
                 if (!reader.get(b_standard_chan_assign, error))
                     return false;
 
                 if (b_standard_chan_assign) {
-                    if (!reader.get_n(10, std_value, error))
+                    guint16 value = 0;
+
+                    if (!reader.get_n(10, value, error))
                         return false;
+
                     prog.bed_assignment.push_back(
-                        BedAssignment::from_std(std_value));
+                        BedAssignment::from_std(value));
                 } else {
-                    if (!reader.get_n(17, non_std_value, error))
+                    guint32 value = 0;
+
+                    if (!reader.get_n(17, value, error))
                         return false;
+
                     prog.bed_assignment.push_back(
-                        BedAssignment::from_non_std(non_std_value));
+                        BedAssignment::from_non_std(value));
                 }
             }
         }
 
-        if (prog.content_description & 2U) {
-            if (!reader.get_n(3, prog.intermediate_spatial_format_idx, error))
+        if ((content_description & 2U) != 0) {
+            guint8 intermediate_spatial_format_idx = 0;
+
+            if (!reader.get_n(3, intermediate_spatial_format_idx, error))
                 return false;
 
-            if (prog.intermediate_spatial_format_idx >= kISFCountList.size()) {
+            if (intermediate_spatial_format_idx >= kISFCountList.size()) {
                 error = "invalid intermediate spatial format index";
                 return false;
             }
 
-            prog.beds_or_isf_count +=
-                kISFCountList[prog.intermediate_spatial_format_idx];
+            prog.num_isf_objects =
+                kISFCountList[intermediate_spatial_format_idx];
         }
 
-        if (prog.content_description & 4U) {
+        if ((content_description & 4U) != 0) {
             guint8 num_dynamic_objects_bits = 0;
 
             if (!reader.get_n(5, num_dynamic_objects_bits, error))
@@ -357,37 +523,40 @@ static bool parse_program_assignment(BitReader& reader, ProgramAssignment& prog,
 
             if (num_dynamic_objects_bits == 31) {
                 guint8 ext = 0;
+
                 if (!reader.get_n(7, ext, error))
                     return false;
+
                 num_dynamic_objects_bits =
                     static_cast<guint8>(num_dynamic_objects_bits + ext);
             }
 
-            prog.num_dynamic_objects = num_dynamic_objects_bits + 1;
+            prog.num_dynamic_objects =
+                static_cast<gsize>(num_dynamic_objects_bits) + 1;
         }
 
-        if (prog.content_description & 8U) {
-            guint32 reserved_data_size = 0;
+        if ((content_description & 8U) != 0) {
+            guint32 reserved_data_size_bits = 0;
 
-            if (!reader.get_n(4, reserved_data_size, error))
+            if (!reader.get_n(4, reserved_data_size_bits, error))
                 return false;
 
-            reserved_data_size = (reserved_data_size + 1) << 3;
-            if (!reader.skip_n(reserved_data_size, error))
+            if (!reader.skip_n(
+                    (static_cast<guint64>(reserved_data_size_bits) + 1) << 3,
+                    error)) {
                 return false;
+            }
         }
     }
 
     for (const auto& bed : prog.bed_assignment)
-        prog.beds_or_isf_count =
-            static_cast<guint8>(prog.beds_or_isf_count + bed.count_beds());
+        prog.num_bed_objects += bed.count_beds();
 
     return true;
 }
 
 static bool parse_block_update_info(BitReader& reader, BlockUpdateInfo& info,
                                     std::string& error) {
-    guint16 ramp_duration_bits = 0;
     bool use_ramp_duration_idx = false;
 
     if (!reader.get_n(6, info.block_offset_factor_bits, error))
@@ -405,13 +574,13 @@ static bool parse_block_update_info(BitReader& reader, BlockUpdateInfo& info,
     case 2:
         info.ramp_duration = 1536;
         break;
-    case 3: {
-        guint64 idx = 0;
-
+    case 3:
         if (!reader.get(use_ramp_duration_idx, error))
             return false;
 
         if (use_ramp_duration_idx) {
+            guint64 idx = 0;
+
             if (!reader.get_n(4, idx, error))
                 return false;
 
@@ -422,12 +591,10 @@ static bool parse_block_update_info(BitReader& reader, BlockUpdateInfo& info,
 
             info.ramp_duration = kRampDurationList[idx];
         } else {
-            if (!reader.get_n(11, ramp_duration_bits, error))
+            if (!reader.get_n(11, info.ramp_duration, error))
                 return false;
-            info.ramp_duration = ramp_duration_bits;
         }
         break;
-    }
     default:
         error = "invalid ramp duration code";
         return false;
@@ -438,17 +605,18 @@ static bool parse_block_update_info(BitReader& reader, BlockUpdateInfo& info,
 
 static bool parse_md_update_info(BitReader& reader, MDUpdateInfo& info,
                                  std::string& error) {
-    guint8 sample_offset_idx = 0;
-    guint8 sample_offset_bits = 0;
+    guint8 sample_offset_code = 0;
 
-    if (!reader.get_n(2, info.sample_offset_code, error))
+    if (!reader.get_n(2, sample_offset_code, error))
         return false;
 
-    switch (info.sample_offset_code) {
+    switch (sample_offset_code) {
     case 0:
         info.sample_offset = 0;
         break;
-    case 1:
+    case 1: {
+        guint8 sample_offset_idx = 0;
+
         if (!reader.get_n(2, sample_offset_idx, error))
             return false;
 
@@ -470,270 +638,424 @@ static bool parse_md_update_info(BitReader& reader, MDUpdateInfo& info,
             return false;
         }
         break;
-    case 2:
+    }
+    case 2: {
+        guint8 sample_offset_bits = 0;
+
         if (!reader.get_n(5, sample_offset_bits, error))
             return false;
+
         info.sample_offset = sample_offset_bits;
         break;
+    }
     default:
         error = "invalid sample offset code";
         return false;
     }
 
-    if (!reader.get_n(3, info.num_obj_info_blocks, error))
-        return false;
-    info.num_obj_info_blocks =
-        static_cast<guint8>(info.num_obj_info_blocks + 1);
+    guint8 num_obj_info_blocks_bits = 0;
 
+    if (!reader.get_n(3, num_obj_info_blocks_bits, error))
+        return false;
+
+    info.num_obj_info_blocks = static_cast<gsize>(num_obj_info_blocks_bits) + 1;
     info.block_update_info.reserve(info.num_obj_info_blocks);
-    for (guint8 i = 0; i < info.num_obj_info_blocks; i++) {
-        BlockUpdateInfo block;
 
-        if (!parse_block_update_info(reader, block, error))
+    for (gsize i = 0; i < info.num_obj_info_blocks; ++i) {
+        BlockUpdateInfo block_update_info;
+
+        if (!parse_block_update_info(reader, block_update_info, error))
             return false;
 
-        info.block_update_info.push_back(block);
+        info.block_update_info.push_back(block_update_info);
     }
 
     return true;
 }
 
-static bool parse_object_basic_info(BitReader& reader, ObjectInfoBlock& object,
+static bool parse_object_basic_info(BitReader& reader, OAMDParserState& state,
+                                    gsize object_index, gsize block_index,
+                                    guint8 status_idx,
+                                    const ObjectBasicInfo& prev_basic_info,
+                                    ObjectBasicInfo& basic_info,
                                     std::string& error) {
-    guint8 obj_basic_info = 0;
-    ObjectBasicInfo basic;
+    guint8 object_basic_info_bits = 0;
 
-    if (object.object_basic_info_status_idx == 1) {
-        obj_basic_info = 3;
-    } else if (!reader.get_n(2, obj_basic_info, error)) {
+    basic_info = prev_basic_info;
+
+    if (status_idx == 1) {
+        object_basic_info_bits = 3;
+    } else if (!reader.get_n(2, object_basic_info_bits, error)) {
         return false;
     }
 
-    if (obj_basic_info & 1U) {
-        if (!reader.get_n(2, basic.object_gain_idx, error))
+    if ((object_basic_info_bits & 1U) != 0) {
+        guint8 object_gain_idx = 0;
+
+        if (!reader.get_n(2, object_gain_idx, error))
             return false;
 
-        if (basic.object_gain_idx == 2) {
-            if (!reader.get_n(6, basic.object_gain_bits, error))
+        switch (object_gain_idx) {
+        case 0:
+            basic_info.object_gain = 0;
+            break;
+        case 1:
+            basic_info.object_gain = kGainMinusInfinity;
+            break;
+        case 2: {
+            guint8 object_gain_bits = 0;
+
+            if (!reader.get_n(6, object_gain_bits, error))
                 return false;
+
+            basic_info.object_gain =
+                (object_gain_bits <= 14)
+                    ? static_cast<gint8>(object_gain_bits + 1)
+                    : static_cast<gint8>(object_gain_bits - 64);
+            break;
         }
+        case 3:
+            basic_info.object_gain =
+                (object_index == 0) ? 0 : state.prev_object_gain[block_index];
+            break;
+        default:
+            error = "invalid object gain index";
+            return false;
+        }
+
+        state.prev_object_gain[block_index] = basic_info.object_gain;
     }
 
-    if (obj_basic_info & 2U) {
-        if (!reader.get(basic.b_default_object_priority, error))
+    if ((object_basic_info_bits & 2U) != 0) {
+        bool b_default_object_priority = false;
+
+        if (!reader.get(b_default_object_priority, error))
             return false;
 
-        if (!basic.b_default_object_priority) {
-            if (!reader.get_n(5, basic.object_priority_bits, error))
-                return false;
-            basic.object_priority =
-                static_cast<double>(basic.object_priority_bits) / 32.0;
+        if (b_default_object_priority) {
+            basic_info.object_priority = 1.0;
         } else {
-            basic.object_priority = 1.0;
+            guint8 object_priority_bits = 0;
+
+            if (!reader.get_n(5, object_priority_bits, error))
+                return false;
+
+            basic_info.object_priority =
+                static_cast<double>(object_priority_bits) / 32.0;
         }
     }
 
-    object.object_basic_info = basic;
     return true;
 }
 
-static bool parse_object_render_info(BitReader& reader, ObjectInfoBlock& object,
-                                     guint8 block, std::string& error) {
-    guint8 object_render_info = 0;
-    ObjectRenderInfo render;
+static bool parse_object_render_info(BitReader& reader, guint8 status_idx,
+                                     gsize block_index,
+                                     const ObjectRenderInfo& prev_render_info,
+                                     ObjectRenderInfo& render_info,
+                                     std::string& error) {
+    guint8 object_render_info_bits = 0;
 
-    if (object.object_render_info_status_idx == 1) {
-        object_render_info = 15;
-    } else if (!reader.get_n(4, object_render_info, error)) {
+    render_info = prev_render_info;
+
+    if (status_idx == 1) {
+        object_render_info_bits = 15;
+    } else if (!reader.get_n(4, object_render_info_bits, error)) {
         return false;
     }
 
-    if (object_render_info & 1U) {
-        gint64 signed_bits = 0;
-        guint64 bits = 0;
-        bool sign_z = false;
-
-        if (block == 0) {
-            render.b_differential_position_specified = false;
-        } else if (!reader.get(render.b_differential_position_specified,
+    if ((object_render_info_bits & 1U) != 0) {
+        if (block_index == 0) {
+            render_info.b_differential_position_specified = false;
+        } else if (!reader.get(render_info.b_differential_position_specified,
                                error)) {
             return false;
         }
 
-        if (render.b_differential_position_specified) {
-            if (!get_sn(reader, 3, signed_bits, error))
-                return false;
-            render.pos3d_x =
-                std::min(static_cast<double>(signed_bits) / 62.0, 1.0);
+        if (render_info.b_differential_position_specified) {
+            gint64 signed_bits = 0;
 
             if (!get_sn(reader, 3, signed_bits, error))
                 return false;
-            render.pos3d_y =
-                std::min(static_cast<double>(signed_bits) / 62.0, 1.0);
+            render_info.pos3d[0] = prev_render_info.pos3d[0] +
+                                   static_cast<double>(signed_bits) / 62.0;
 
             if (!get_sn(reader, 3, signed_bits, error))
                 return false;
-            render.pos3d_z =
-                std::min(static_cast<double>(signed_bits) / 15.0, 1.0);
+            render_info.pos3d[1] = prev_render_info.pos3d[1] +
+                                   static_cast<double>(signed_bits) / 62.0;
+
+            if (!get_sn(reader, 3, signed_bits, error))
+                return false;
+            render_info.pos3d[2] = prev_render_info.pos3d[2] +
+                                   static_cast<double>(signed_bits) / 15.0;
         } else {
-            if (!reader.get_n(6, bits, error))
-                return false;
-            render.pos3d_x = static_cast<double>(bits) / 62.0;
+            guint64 bits = 0;
+            bool sign_z = false;
 
             if (!reader.get_n(6, bits, error))
                 return false;
-            render.pos3d_y = static_cast<double>(bits) / 62.0;
+            render_info.pos3d[0] = static_cast<double>(bits) / 62.0;
+
+            if (!reader.get_n(6, bits, error))
+                return false;
+            render_info.pos3d[1] = static_cast<double>(bits) / 62.0;
 
             if (!reader.get(sign_z, error))
                 return false;
-
             if (!reader.get_n(4, bits, error))
                 return false;
-            render.pos3d_z = std::min((static_cast<double>(bits) / 15.0) *
-                                          (sign_z ? 1.0 : -1.0),
-                                      1.0);
+            render_info.pos3d[2] =
+                static_cast<double>(bits) / 15.0 * (sign_z ? 1.0 : -1.0);
         }
 
-        if (!reader.get(render.b_object_distance_specified, error))
+        if (!reader.get(render_info.b_object_distance_specified, error))
             return false;
 
-        if (render.b_object_distance_specified) {
-            if (!reader.get(render.b_object_at_infinity, error))
+        if (render_info.b_object_distance_specified) {
+            if (!reader.get(render_info.b_object_at_infinity, error))
                 return false;
-
-            if (!render.b_object_at_infinity) {
-                if (!reader.get_n(4, render.distance_factor_idx, error))
-                    return false;
+            if (!render_info.b_object_at_infinity &&
+                !reader.get_n(4, render_info.distance_factor_idx, error)) {
+                return false;
             }
         }
     }
 
-    if (object_render_info & 2U) {
-        if (!reader.get_n(3, render.zone_constraints_idx, error))
+    if ((object_render_info_bits & 2U) != 0) {
+        if (!reader.get_n(3, render_info.zone_constraints_idx, error))
             return false;
-        if (!reader.get(render.b_enable_elevation, error))
+        if (!reader.get(render_info.b_enable_elevation, error))
             return false;
     }
 
-    if (object_render_info & 4U) {
-        if (!reader.get_n(2, render.object_size_idx, error))
+    if ((object_render_info_bits & 4U) != 0) {
+        guint8 object_size_idx = 0;
+
+        if (!reader.get_n(2, object_size_idx, error))
             return false;
 
-        if (render.object_size_idx == 1) {
-            if (!reader.get_n(5, render.object_size_bits, error))
+        render_info.b_has_size3d = false;
+
+        switch (object_size_idx) {
+        case 0:
+            render_info.object_size = {0.0, 0.0, 0.0};
+            break;
+        case 1: {
+            guint8 object_size_bits = 0;
+
+            if (!reader.get_n(5, object_size_bits, error))
                 return false;
-        } else if (render.object_size_idx == 2) {
-            if (!reader.get_n(5, render.object_width_bits, error))
+
+            const double object_size =
+                static_cast<double>(object_size_bits) / 31.0;
+            render_info.object_size = {object_size, object_size, object_size};
+            break;
+        }
+        case 2: {
+            guint8 object_width_bits = 0;
+            guint8 object_depth_bits = 0;
+            guint8 object_height_bits = 0;
+
+            if (!reader.get_n(5, object_width_bits, error))
                 return false;
-            if (!reader.get_n(5, render.object_depth_bits, error))
+            if (!reader.get_n(5, object_depth_bits, error))
                 return false;
-            if (!reader.get_n(5, render.object_height_bits, error))
+            if (!reader.get_n(5, object_height_bits, error))
                 return false;
+
+            render_info.object_size = {
+                static_cast<double>(object_width_bits) / 31.0,
+                static_cast<double>(object_depth_bits) / 31.0,
+                static_cast<double>(object_height_bits) / 31.0,
+            };
+            render_info.b_has_size3d = true;
+            break;
+        }
+        default:
+            render_info.object_size = {0.0, 0.0, 0.0};
+            render_info.b_has_size3d = false;
+            break;
         }
     }
 
-    if (object_render_info & 8U) {
-        if (!reader.get(render.b_object_use_screen_ref, error))
+    if ((object_render_info_bits & 8U) != 0) {
+        if (!reader.get(render_info.b_object_use_screen_ref, error))
             return false;
 
-        if (render.b_object_use_screen_ref) {
-            if (!reader.get_n(3, render.screen_factor_bits, error))
+        if (render_info.b_object_use_screen_ref) {
+            guint8 screen_factor_bits = 0;
+            guint8 depth_factor_idx = 0;
+
+            if (!reader.get_n(3, screen_factor_bits, error))
                 return false;
-            if (!reader.get_n(2, render.depth_factor_idx, error))
+            if (!reader.get_n(2, depth_factor_idx, error))
                 return false;
+
+            render_info.screen_factor =
+                static_cast<double>(screen_factor_bits + 1) / 8.0;
+            render_info.depth_factor =
+                0.25 * static_cast<double>(depth_factor_idx + 1);
         } else {
-            render.screen_factor_bits = 0;
+            render_info.screen_factor = 0.0;
         }
     }
 
-    if (!reader.get(render.b_object_snap, error))
+    if (!reader.get(render_info.b_object_snap, error))
         return false;
 
-    object.object_render_info = render;
     return true;
 }
 
-static bool parse_object_info_block(BitReader& reader,
-                                    const ProgramAssignment& program,
-                                    guint8 block, guint8 object_index,
-                                    ObjectInfoBlock& object,
+static bool parse_object_info_block(BitReader& reader, OAMDParserState& state,
+                                    gsize object_index, gsize block_index,
+                                    ObjectInfoBlock& object_info_block,
                                     std::string& error) {
-    if (!reader.get(object.b_object_not_active, error))
+    if (!reader.get(object_info_block.b_object_not_active, error))
         return false;
 
-    if (object.b_object_not_active) {
-        object.object_basic_info_status_idx = 0;
-    } else if (block == 0) {
-        object.object_basic_info_status_idx = 1;
-    } else if (!reader.get_n(2, object.object_basic_info_status_idx, error)) {
-        return false;
-    }
-
-    if ((object.object_basic_info_status_idx & 1U) != 0 &&
-        !parse_object_basic_info(reader, object, error)) {
+    if (object_info_block.b_object_not_active) {
+        object_info_block.object_basic_info_status_idx = 0;
+    } else if (block_index == 0) {
+        object_info_block.object_basic_info_status_idx = 1;
+    } else if (!reader.get_n(2, object_info_block.object_basic_info_status_idx,
+                             error)) {
         return false;
     }
 
-    object.b_object_in_bed_or_isf = object_index < program.beds_or_isf_count;
+    {
+        const ObjectBasicInfo prev_basic_info =
+            (block_index == 0) ? ObjectBasicInfo{}
+                               : state.prev_object_basic_info;
 
-    if (object.b_object_not_active) {
-        object.object_render_info_status_idx = 0;
-    } else if (!object.b_object_in_bed_or_isf) {
-        if (block == 0) {
-            object.object_render_info_status_idx = 1;
-        } else if (!reader.get_n(2, object.object_render_info_status_idx,
-                                 error)) {
+        switch (object_info_block.object_basic_info_status_idx) {
+        case 0:
+            object_info_block.object_basic_info = ObjectBasicInfo{};
+            object_info_block.has_object_basic_info = false;
+            break;
+        case 1:
+        case 3:
+            if (!parse_object_basic_info(
+                    reader, state, object_index, block_index,
+                    object_info_block.object_basic_info_status_idx,
+                    prev_basic_info, object_info_block.object_basic_info,
+                    error)) {
+                return false;
+            }
+            object_info_block.has_object_basic_info = true;
+            break;
+        case 2:
+            object_info_block.object_basic_info = prev_basic_info;
+            object_info_block.has_object_basic_info = true;
+            break;
+        default:
+            error = "invalid object basic info status";
+            return false;
+        }
+
+        state.prev_object_basic_info = object_info_block.object_basic_info;
+    }
+
+    object_info_block.b_object_in_bed_or_isf =
+        object_index < state.program_assignment.beds_or_isf_count();
+
+    if (object_info_block.b_object_not_active) {
+        object_info_block.object_render_info_status_idx = 0;
+    } else if (!object_info_block.b_object_in_bed_or_isf) {
+        if (block_index == 0) {
+            object_info_block.object_render_info_status_idx = 1;
+        } else if (!reader.get_n(
+                       2, object_info_block.object_render_info_status_idx,
+                       error)) {
             return false;
         }
     } else {
-        object.object_render_info_status_idx = 0;
+        object_info_block.object_render_info_status_idx = 0;
     }
 
-    if ((object.object_render_info_status_idx & 1U) != 0 &&
-        !parse_object_render_info(reader, object, block, error)) {
-        return false;
+    {
+        const ObjectRenderInfo prev_render_info =
+            (block_index == 0) ? ObjectRenderInfo{}
+                               : state.prev_object_render_info;
+
+        switch (object_info_block.object_render_info_status_idx) {
+        case 0:
+            object_info_block.object_render_info = ObjectRenderInfo{};
+            object_info_block.has_object_render_info = false;
+            break;
+        case 1:
+        case 3:
+            if (!parse_object_render_info(
+                    reader, object_info_block.object_render_info_status_idx,
+                    block_index, prev_render_info,
+                    object_info_block.object_render_info, error)) {
+                return false;
+            }
+            object_info_block.has_object_render_info = true;
+            break;
+        case 2:
+            object_info_block.object_render_info = prev_render_info;
+            object_info_block.has_object_render_info = true;
+            break;
+        default:
+            error = "invalid object render info status";
+            return false;
+        }
+
+        state.prev_object_render_info = object_info_block.object_render_info;
     }
 
-    if (!reader.get(object.b_additional_table_data_exists, error))
+    if (!reader.get(object_info_block.b_additional_table_data_exists, error))
         return false;
 
-    if (object.b_additional_table_data_exists) {
-        if (!reader.get_n(4, object.additional_table_data_size_bits, error))
+    if (object_info_block.b_additional_table_data_exists) {
+        if (!reader.get_n(4, object_info_block.additional_table_data_size_bits,
+                          error)) {
             return false;
-        if (!reader.skip_n(object.additional_table_data_size_bits + 1, error))
+        }
+
+        if (!reader.skip_n(
+                (static_cast<guint64>(
+                     object_info_block.additional_table_data_size_bits) +
+                 1) << 3,
+                error)) {
             return false;
+        }
     }
 
     return true;
 }
 
-static bool parse_object_element(BitReader& reader,
-                                 const ObjectAudioMetadataPayload& payload,
+static bool parse_object_element(BitReader& reader, OAMDParserState& state,
                                  ObjectElement& element, std::string& error) {
     if (!parse_md_update_info(reader, element.md_update_info, error))
         return false;
     if (!reader.get(element.b_reserved_data_not_present, error))
         return false;
 
-    if (!element.b_reserved_data_not_present && !reader.skip_n(5, error))
+    if (!element.b_reserved_data_not_present &&
+        !reader.get_n(5, element.reserved_data, error)) {
         return false;
+    }
 
-    element.object_data.reserve(payload.object_count);
-    for (guint8 i = 0; i < payload.object_count; i++) {
+    element.object_data.reserve(state.object_count);
+
+    for (gsize object_index = 0; object_index < state.object_count;
+         ++object_index) {
         ObjectData object_data;
 
-        object_data.object_info_block.reserve(
-            element.md_update_info.num_obj_info_blocks);
-        for (guint8 block = 0;
-             block < element.md_update_info.num_obj_info_blocks; block++) {
-            ObjectInfoBlock info_block;
+        object_data.reserve(element.md_update_info.num_obj_info_blocks);
+        for (gsize block_index = 0;
+             block_index < element.md_update_info.num_obj_info_blocks;
+             ++block_index) {
+            ObjectInfoBlock object_info_block;
 
-            if (!parse_object_info_block(reader, payload.program_assignment,
-                                         block, i, info_block, error)) {
+            if (!parse_object_info_block(reader, state, object_index,
+                                         block_index, object_info_block,
+                                         error)) {
                 return false;
             }
 
-            object_data.object_info_block.push_back(info_block);
+            object_data.push_back(object_info_block);
         }
 
         element.object_data.push_back(std::move(object_data));
@@ -742,41 +1064,302 @@ static bool parse_object_element(BitReader& reader,
     return true;
 }
 
-static bool parse_oa_element_md(BitReader& reader,
-                                ObjectAudioMetadataPayload& payload,
+static bool parse_trim_element(BitReader& reader, const OAMDParserState& state,
+                               TrimElement& element, std::string& error) {
+    if (!reader.get_n(2, element.warp_mode, error))
+        return false;
+    if (!reader.get_n(2, element.reserved, error))
+        return false;
+    if (!reader.get_n(2, element.global_trim_mode, error))
+        return false;
+
+    if (element.global_trim_mode == 2) {
+        for (auto& trim : element.trims) {
+            Trim value;
+
+            if (!reader.get(value.b_default_trim, error))
+                return false;
+
+            if (value.b_default_trim) {
+                trim = value;
+                continue;
+            }
+
+            if (!reader.get(value.b_disable_trim, error))
+                return false;
+
+            if (!value.b_disable_trim) {
+                guint8 trim_balance_presence = 0;
+
+                if (!reader.get_n(5, trim_balance_presence, error))
+                    return false;
+
+                if ((trim_balance_presence & 0x1U) != 0) {
+                    guint8 idx = 0;
+
+                    if (!reader.get_n(4, idx, error))
+                        return false;
+                    value.trim_centre = kTrimLut[idx];
+                }
+
+                if ((trim_balance_presence & 0x2U) != 0) {
+                    guint8 idx = 0;
+
+                    if (!reader.get_n(4, idx, error))
+                        return false;
+                    value.trim_surround = kTrimLut[idx];
+                }
+
+                if ((trim_balance_presence & 0x4U) != 0) {
+                    guint8 idx = 0;
+
+                    if (!reader.get_n(4, idx, error))
+                        return false;
+                    value.trim_height = kTrimLut[idx];
+                }
+
+                if ((trim_balance_presence & 0x8U) != 0) {
+                    bool sign = false;
+                    guint8 bits = 0;
+
+                    if (!reader.get(sign, error))
+                        return false;
+                    if (!reader.get_n(4, bits, error))
+                        return false;
+                    value.bal3d_y_tb = static_cast<double>(bits + 1) / 16.0 *
+                                       (sign ? 1.0 : -1.0);
+                }
+
+                if ((trim_balance_presence & 0x10U) != 0) {
+                    bool sign = false;
+                    guint8 bits = 0;
+
+                    if (!reader.get(sign, error))
+                        return false;
+                    if (!reader.get_n(4, bits, error))
+                        return false;
+                    value.bal3d_y_lis = static_cast<double>(bits + 1) / 16.0 *
+                                        (sign ? 1.0 : -1.0);
+                }
+            }
+
+            trim = value;
+        }
+    }
+
+    if (!reader.get(element.b_disable_trim_per_obj, error))
+        return false;
+
+    if (element.b_disable_trim_per_obj) {
+        element.b_disable_trim.reserve(state.object_count);
+
+        for (gsize i = 0; i < state.object_count; ++i) {
+            bool value = false;
+
+            if (!reader.get(value, error))
+                return false;
+
+            element.b_disable_trim.push_back(value);
+        }
+    }
+
+    return true;
+}
+
+static bool parse_extended_object_element(BitReader& reader,
+                                          OAMDParserState& state,
+                                          ExtendedObjectElement& element,
+                                          std::string& error) {
+    if (!reader.get(element.b_obj_div_block, error))
+        return false;
+
+    if (!state.object_element.has_value())
+        return true;
+
+    const auto& object_element = *state.object_element;
+
+    if (element.b_obj_div_block) {
+        element.object_div_block.reserve(state.object_count);
+
+        for (gsize object_index = 0; object_index < state.object_count;
+             ++object_index) {
+            std::vector<ObjectDivergenceBlock> block_list;
+
+            if (object_index < object_element.object_data.size())
+                block_list.reserve(
+                    object_element.object_data[object_index].size());
+
+            for (const auto& object_info_block :
+                 object_element.object_data[object_index]) {
+                ObjectDivergenceBlock block;
+
+                if (!object_info_block.b_object_not_active &&
+                    !object_info_block.b_object_in_bed_or_isf) {
+                    if (!reader.get(block.b_object_divergence, error))
+                        return false;
+
+                    if (block.b_object_divergence) {
+                        if (!reader.get_n(2, block.object_div_mode, error))
+                            return false;
+
+                        if (block.object_div_mode == 0) {
+                            if (!reader.get_n(2, block.object_div_table, error))
+                                return false;
+                            block.object_divergence =
+                                kObjectDivTableTable[block.object_div_table];
+                        } else if (block.object_div_mode == 1) {
+                            if (!block_list.empty())
+                                block = block_list.back();
+                        } else {
+                            if (!reader.get_n(6, block.object_div_code, error))
+                                return false;
+                            if (kObjectDivCodeTable[block.object_div_code]
+                                    .has_value()) {
+                                block.object_divergence =
+                                    *kObjectDivCodeTable[block.object_div_code];
+                            }
+                        }
+                    }
+                }
+
+                block_list.push_back(block);
+            }
+
+            element.object_div_block.push_back(std::move(block_list));
+        }
+    }
+
+    if (!reader.get(element.b_ext_prec_pos_block, error))
+        return false;
+
+    if (element.b_ext_prec_pos_block) {
+        element.ext_prec_pos_block.reserve(state.object_count);
+
+        for (gsize object_index = 0; object_index < state.object_count;
+             ++object_index) {
+            std::vector<ExtendedPrecisionPositionBlock> block_list;
+
+            if (object_index < object_element.object_data.size())
+                block_list.reserve(
+                    object_element.object_data[object_index].size());
+
+            for (const auto& object_info_block :
+                 object_element.object_data[object_index]) {
+                ExtendedPrecisionPositionBlock block;
+
+                if (!object_info_block.b_object_not_active &&
+                    !object_info_block.b_object_in_bed_or_isf) {
+                    bool b_ext_prec_pos = false;
+
+                    if (!reader.get(b_ext_prec_pos, error))
+                        return false;
+
+                    if (b_ext_prec_pos) {
+                        guint8 ext_prec_pos_presence = 0;
+
+                        if (!reader.get_n(3, ext_prec_pos_presence, error))
+                            return false;
+
+                        if ((ext_prec_pos_presence & 0x1U) != 0) {
+                            guint8 idx = 0;
+
+                            if (!reader.get_n(2, idx, error))
+                                return false;
+                            block.ext_prec_pos3d_x =
+                                kExtPrecPos3DLut[idx] / 310.0;
+                        }
+
+                        if ((ext_prec_pos_presence & 0x2U) != 0) {
+                            guint8 idx = 0;
+
+                            if (!reader.get_n(2, idx, error))
+                                return false;
+                            block.ext_prec_pos3d_y =
+                                kExtPrecPos3DLut[idx] / 310.0;
+                        }
+
+                        if ((ext_prec_pos_presence & 0x4U) != 0) {
+                            guint8 idx = 0;
+
+                            if (!reader.get_n(2, idx, error))
+                                return false;
+                            block.ext_prec_pos3d_z =
+                                kExtPrecPos3DLut[idx] / 75.0;
+                        }
+                    }
+                }
+
+                block_list.push_back(block);
+            }
+
+            element.ext_prec_pos_block.push_back(std::move(block_list));
+        }
+    }
+
+    return true;
+}
+
+static bool parse_oa_element_md(BitReader& reader, OAMDParserState& state,
                                 OAElementMD& md, std::string& error) {
-    guint64 pos_end = 0;
+    guint64 element_size_bits = 0;
 
     if (!reader.get_n(4, md.oa_element_id_idx, error))
         return false;
-    if (!get_variable_bits_max(reader, 4, 4, md.oa_element_size_bits, error))
+    if (!get_variable_bits_max(reader, 4, 4, element_size_bits, error))
         return false;
 
-    pos_end = std::min(reader.position() + md.oa_element_size_bits + 1,
-                       reader.position() + reader.available());
+    md.oa_element_size_bits = element_size_bits;
 
-    if (payload.b_alternate_object_data_present) {
-        guint8 value = 0;
-        if (!reader.get_n(4, value, error))
+    const guint64 element_size = (element_size_bits + 1) << 3;
+    const guint64 pos_start = reader.position();
+    const guint64 pos_end =
+        pos_start + std::min(element_size, reader.available());
+
+    if (state.b_alternate_object_data_present) {
+        guint8 alternate_object_data_id_idx = 0;
+
+        if (!reader.get_n(4, alternate_object_data_id_idx, error))
             return false;
-        md.alternate_object_data_id_idx = value;
+
+        md.alternate_object_data_id_idx = alternate_object_data_id_idx;
     }
 
     if (!reader.get(md.b_discard_unknown_element, error))
         return false;
 
-    if (md.oa_element_id_idx == 1) {
+    switch (md.oa_element_id_idx) {
+    case 1: {
         ObjectElement object_element;
 
-        if (!parse_object_element(reader, payload, object_element, error))
+        if (!parse_object_element(reader, state, object_element, error))
             return false;
+        state.object_element = std::move(object_element);
+        break;
+    }
+    case 2: {
+        TrimElement trim_element;
 
-        md.object_element = std::move(object_element);
+        if (!parse_trim_element(reader, state, trim_element, error))
+            return false;
+        state.trim_element = std::move(trim_element);
+        break;
+    }
+    case 5: {
+        ExtendedObjectElement extended_object_element;
+
+        if (!parse_extended_object_element(reader, state,
+                                           extended_object_element, error)) {
+            return false;
+        }
+        state.extended_object_element = std::move(extended_object_element);
+        break;
+    }
+    default:
+        break;
     }
 
     if (pos_end > reader.position() &&
-        !reader.skip_n(static_cast<guint32>(pos_end - reader.position()),
-                       error)) {
+        !reader.skip_n(pos_end - reader.position(), error)) {
         return false;
     }
 
@@ -787,22 +1370,24 @@ static bool read_payload(const guint8* bytes, gsize size,
                          ObjectAudioMetadataPayload& payload,
                          std::string& error) {
     BitReader reader(bytes, size);
+    OAMDParserState state;
     guint8 object_count_bits = 0;
     guint8 oa_element_count_bits = 0;
 
-    if (!reader.get_n(2, payload.oa_md_version_bits, error))
+    if (!reader.get_n(2, payload.oamd_version, error))
         return false;
 
-    if (payload.oa_md_version_bits == 3) {
+    if (payload.oamd_version == 3) {
         guint8 ext = 0;
+
         if (!reader.get_n(3, ext, error))
             return false;
-        payload.oa_md_version_bits =
-            static_cast<guint8>(payload.oa_md_version_bits + ext);
+
+        payload.oamd_version = static_cast<guint8>(payload.oamd_version + ext);
     }
 
-    if (payload.oa_md_version_bits != 0) {
-        error = "unsupported oa_md_version_bits";
+    if (payload.oamd_version != 0) {
+        error = "unsupported OAMD version";
         return false;
     }
 
@@ -811,37 +1396,53 @@ static bool read_payload(const guint8* bytes, gsize size,
 
     if (object_count_bits == 31) {
         guint8 ext = 0;
+
         if (!reader.get_n(7, ext, error))
             return false;
+
         object_count_bits = static_cast<guint8>(object_count_bits + ext);
     }
 
-    payload.object_count = object_count_bits + 1;
-
-    if (!parse_program_assignment(reader, payload.program_assignment, error))
+    state.object_count = static_cast<gsize>(object_count_bits) + 1;
+    if (state.object_count > kMaxObjectCount) {
+        error = "object count exceeds supported maximum";
         return false;
-    if (!reader.get(payload.b_alternate_object_data_present, error))
+    }
+
+    if (!parse_program_assignment(reader, state, error))
+        return false;
+    if (!reader.get(state.b_alternate_object_data_present, error))
         return false;
     if (!reader.get_n(4, oa_element_count_bits, error))
         return false;
 
     if (oa_element_count_bits == 15) {
         guint8 ext = 0;
+
         if (!reader.get_n(5, ext, error))
             return false;
+
         oa_element_count_bits =
             static_cast<guint8>(oa_element_count_bits + ext);
     }
 
     payload.oa_element_md.reserve(oa_element_count_bits);
-    for (guint8 i = 0; i < oa_element_count_bits; i++) {
+    for (guint8 i = 0; i < oa_element_count_bits; ++i) {
         OAElementMD md;
 
-        if (!parse_oa_element_md(reader, payload, md, error))
+        if (!parse_oa_element_md(reader, state, md, error))
             return false;
 
         payload.oa_element_md.push_back(std::move(md));
     }
+
+    payload.object_count = state.object_count;
+    payload.program_assignment = std::move(state.program_assignment);
+    payload.b_alternate_object_data_present =
+        state.b_alternate_object_data_present;
+    payload.object_element = std::move(state.object_element);
+    payload.trim_element = std::move(state.trim_element);
+    payload.extended_object_element = std::move(state.extended_object_element);
 
     return true;
 }
@@ -878,186 +1479,191 @@ struct YamlConfiguration {
     std::vector<YamlEvent> events{};
 };
 
-namespace {
+static std::vector<bool>
+build_trim_bypass_vector(const ObjectAudioMetadataPayload& payload) {
+    std::vector<bool> out(payload.object_count, false);
+
+    if (!payload.trim_element.has_value())
+        return out;
+
+    const auto& trim_element = *payload.trim_element;
+
+    if (trim_element.b_disable_trim_per_obj) {
+        out.assign(trim_element.b_disable_trim.begin(),
+                   trim_element.b_disable_trim.end());
+        if (out.size() < payload.object_count)
+            out.resize(payload.object_count, false);
+        return out;
+    }
+
+    if (trim_element.global_trim_mode == 1)
+        std::fill(out.begin(), out.end(), true);
+
+    return out;
+}
+
+static std::vector<gsize>
+collect_bed_indices(const ProgramAssignment& program_assignment) {
+    std::vector<gsize> out;
+
+    for (const auto& bed_assignment : program_assignment.bed_assignment) {
+        auto indices = bed_assignment.to_index_vec();
+        out.insert(out.end(), indices.begin(), indices.end());
+    }
+
+    return out;
+}
+
+static guint32 map_bed_index_to_id(gsize index) {
+    if (index < 8)
+        return static_cast<guint32>(index);
+    if (index < 10)
+        return static_cast<guint32>(index + 122);
+    if (index < 12)
+        return static_cast<guint32>(index - 2);
+
+    return static_cast<guint32>(index + 120);
+}
 
 static bool build_configuration(const ObjectAudioMetadataPayload& payload,
                                 guint32 sample_rate, guint64 sample_pos,
                                 YamlConfiguration& config, std::string& error) {
-    const auto object_count = static_cast<gsize>(payload.object_count);
-    gint8 prev_object_gain = 0;
-    guint64 event_sample_pos = sample_pos;
+    const auto object_count = payload.object_count;
+    const auto pos_vec = payload.get_damf_pos();
+    const auto trim_bypass_vec = build_trim_bypass_vector(payload);
+    const auto bed_index_vec = collect_bed_indices(payload.program_assignment);
 
-    if (payload.oa_element_md.empty()) {
-        error = "OAMD payload contains no OA elements";
-        return false;
-    }
+    config.sampleRate = sample_rate;
 
-    if (!payload.oa_element_md.front().object_element.has_value()) {
+    if (!payload.object_element.has_value()) {
         error = "OAMD payload does not contain a supported object element";
         return false;
     }
 
-    const auto& object_element = *payload.oa_element_md.front().object_element;
-
-    if (object_element.md_update_info.num_obj_info_blocks != 1) {
-        error = "NOT_IMPL: Multiple Update Blocks";
+    if (payload.program_assignment.num_isf_objects != 0) {
+        error = "NOT_IMPL: ISF objects";
         return false;
     }
 
-    event_sample_pos += object_element.md_update_info.sample_offset;
-    config.sampleRate = sample_rate;
-    config.events.reserve(object_count);
+    const auto& object_element = *payload.object_element;
+    const auto num_blocks = object_element.md_update_info.num_obj_info_blocks;
 
-    for (gsize i = 0; i < object_count; i++) {
-        const auto& object_data =
-            object_element.object_data[i].object_info_block[0];
-        YamlEvent event;
+    if (num_blocks == 0) {
+        error = "OAMD object element contains no update blocks";
+        return false;
+    }
 
-        if (object_data.b_object_in_bed_or_isf) {
-            if (i != 0) {
-                error = "NOT_IMPL: LFE Only";
-                return false;
-            }
-            event.ID = 3;
-        } else {
-            event.ID = static_cast<guint32>(i + 9);
+    config.events.reserve(object_count * num_blocks);
+
+    const guint64 base_sample_pos = sample_pos + payload.evo_sample_offset +
+                                    object_element.md_update_info.sample_offset;
+
+    for (gsize block_index = 0; block_index < num_blocks; ++block_index) {
+        guint64 current_sample_pos = base_sample_pos;
+        guint32 ramp_duration = 0;
+
+        if (block_index <
+            object_element.md_update_info.block_update_info.size()) {
+            const auto& block_update_info =
+                object_element.md_update_info.block_update_info[block_index];
+            /*
+             * For the single-block payloads emitted by the Reference Player
+             * decoder, block_offset_factor_bits does not advance the first
+             * event position. Adding it here produced a +1 samplePos skew
+             * versus the proprietary serializer on real .mlp content.
+             */
+            if (block_index > 0)
+                current_sample_pos +=
+                    block_update_info.block_offset_factor_bits;
+            ramp_duration = block_update_info.ramp_duration;
         }
 
-        event.samplePos = event_sample_pos;
-        event.active = true;
-
-        if (object_data.object_basic_info.has_value()) {
-            const auto& basic = *object_data.object_basic_info;
-            gint8 object_gain = 0;
-
-            event.importance = basic.object_priority;
-
-            switch (basic.object_gain_idx) {
-            case 0:
-                object_gain = 0;
-                break;
-            case 1:
-                object_gain = -128;
-                break;
-            case 2:
-                if (basic.object_gain_bits <= 14) {
-                    object_gain =
-                        static_cast<gint8>(basic.object_gain_bits + 1);
-                } else {
-                    object_gain =
-                        static_cast<gint8>(basic.object_gain_bits - 64);
-                }
-                break;
-            case 3:
-                object_gain = prev_object_gain;
-                break;
-            default:
-                error = "invalid object gain index";
-                return false;
+        for (gsize object_index = 0; object_index < object_count;
+             ++object_index) {
+            if (object_index >= object_element.object_data.size() ||
+                block_index >=
+                    object_element.object_data[object_index].size()) {
+                continue;
             }
 
-            prev_object_gain = object_gain;
-            event.gain =
-                (object_gain == -128) ? "-inf" : std::to_string(object_gain);
-            event.rampLength =
-                object_element.md_update_info.block_update_info[0]
-                    .ramp_duration;
-        }
+            const auto& object_data =
+                object_element.object_data[object_index][block_index];
+            YamlEvent event;
 
-        if (object_data.object_render_info.has_value()) {
-            const auto& render = *object_data.object_render_info;
-
-            if (render.b_differential_position_specified) {
-                error = "NOT_IMPL: diff pos";
-                return false;
-            }
-
-            event.elevation = render.b_enable_elevation;
-            event.snap = render.b_object_snap;
-            event.pos = std::vector<float>{
-                static_cast<float>((render.pos3d_x - 0.5) * 2.0),
-                static_cast<float>((0.5 - render.pos3d_y) * 2.0),
-                static_cast<float>(render.pos3d_z),
-            };
-
-            switch (render.zone_constraints_idx) {
-            case 0:
-                event.zones = "all";
-                break;
-            case 1:
-                event.zones = "no back";
-                break;
-            case 2:
-                event.zones = "no sides";
-                break;
-            case 3:
-                event.zones = "center back";
-                break;
-            case 4:
-                event.zones = "screen only";
-                break;
-            case 5:
-                event.zones = "surround only";
-                break;
-            default:
-                error = "invalid zone constraints index";
-                return false;
-            }
-
-            if (render.object_size_idx == 2) {
-                event.size3D = std::vector<float>{
-                    static_cast<float>(render.object_width_bits) / 31.0f,
-                    static_cast<float>(render.object_depth_bits) / 31.0f,
-                    static_cast<float>(render.object_height_bits) / 31.0f,
-                };
-            } else {
-                switch (render.object_size_idx) {
-                case 0:
-                    event.size = 0.0f;
-                    break;
-                case 1:
-                    event.size =
-                        static_cast<float>(render.object_size_bits) / 31.0f;
-                    break;
-                default:
-                    error = "invalid object size index";
+            if (object_data.b_object_in_bed_or_isf) {
+                if (object_index >= bed_index_vec.size()) {
+                    error = "NOT_IMPL: unsupported bed or ISF assignment";
                     return false;
                 }
+
+                event.ID = map_bed_index_to_id(bed_index_vec[object_index]);
+            } else {
+                event.ID = static_cast<guint32>(
+                    object_index + 10 -
+                    static_cast<gsize>(bed_index_vec.size()));
             }
 
-            event.screenFactor =
-                render.b_object_use_screen_ref
-                    ? 0.0f
-                    : static_cast<float>(render.screen_factor_bits) / 8.0f;
+            event.samplePos = current_sample_pos;
+            event.active = !object_data.b_object_not_active;
 
-            switch (render.depth_factor_idx) {
-            case 0:
-                event.depthFactor = 0.25f;
-                break;
-            case 1:
-                event.depthFactor = 0.5f;
-                break;
-            case 2:
-                event.depthFactor = 0.75f;
-                break;
-            case 3:
-                event.depthFactor = 1.0f;
-                break;
-            default:
-                error = "invalid depth factor index";
-                return false;
+            if (object_data.has_object_basic_info) {
+                event.importance =
+                    object_data.object_basic_info.object_priority;
+                event.gain = object_data.object_basic_info.gain_string();
+                event.rampLength = ramp_duration;
             }
 
-            event.dialog = -1;
-            event.music = -1;
-            event.binauralRenderMode = "undefined";
-        } else {
-            event.binauralRenderMode = "off";
+            if (!object_data.b_object_in_bed_or_isf &&
+                object_data.has_object_render_info) {
+                const auto& render = object_data.object_render_info;
+
+                event.elevation = render.b_enable_elevation;
+                event.snap = render.b_object_snap;
+
+                if (object_index < pos_vec.size() &&
+                    block_index < pos_vec[object_index].size()) {
+                    const auto& pos = pos_vec[object_index][block_index];
+                    event.pos = std::vector<float>{
+                        static_cast<float>(pos[0]),
+                        static_cast<float>(pos[1]),
+                        static_cast<float>(pos[2]),
+                    };
+                }
+
+                if (render.zone_constraints_idx < kZoneLabels.size()) {
+                    event.zones =
+                        std::string(kZoneLabels[render.zone_constraints_idx]);
+                } else {
+                    error = "invalid zone constraints index";
+                    return false;
+                }
+
+                if (render.b_has_size3d) {
+                    event.size3D = std::vector<float>{
+                        static_cast<float>(render.object_size[0]),
+                        static_cast<float>(render.object_size[1]),
+                        static_cast<float>(render.object_size[2]),
+                    };
+                } else {
+                    event.size = static_cast<float>(render.object_size[0]);
+                }
+
+                event.screenFactor = static_cast<float>(render.screen_factor);
+                event.depthFactor = static_cast<float>(render.depth_factor);
+                event.dialog = -1;
+                event.music = -1;
+                event.binauralRenderMode = "undefined";
+            } else {
+                event.binauralRenderMode = "off";
+            }
+
+            event.trimBypass = (object_index < trim_bypass_vec.size())
+                                   ? trim_bypass_vec[object_index]
+                                   : false;
+            event.headTrackMode = "undefined";
+
+            config.events.push_back(std::move(event));
         }
-
-        event.trimBypass = false;
-        event.headTrackMode = "undefined";
-        config.events.push_back(std::move(event));
     }
 
     return true;
@@ -1110,11 +1716,15 @@ static std::vector<YamlEvent>
 compare_event_vectors(const std::vector<YamlEvent>& left,
                       const std::vector<YamlEvent>& right) {
     std::vector<YamlEvent> out;
-    const gsize n = std::min(left.size(), right.size());
 
-    out.reserve(n);
-    for (gsize i = 0; i < n; i++)
-        out.push_back(compare_events(left[i], right[i]));
+    out.reserve(right.size());
+    for (gsize i = 0; i < right.size(); ++i) {
+        if (i < left.size()) {
+            out.push_back(compare_events(left[i], right[i]));
+        } else {
+            out.push_back(right[i]);
+        }
+    }
 
     return out;
 }
@@ -1130,7 +1740,7 @@ static bool is_integer_scalar(std::string_view value) {
         i = 1;
     }
 
-    for (; i < value.size(); i++) {
+    for (; i < value.size(); ++i) {
         if (!g_ascii_isdigit(static_cast<guchar>(value[i])))
             return false;
     }
@@ -1235,7 +1845,6 @@ static void set_error(gchar** error_out, const std::string& message) {
     if (error_out != nullptr)
         *error_out = dup_string(message);
 }
-} // namespace
 
 struct _OAMDSerializerState {
     std::vector<YamlEvent> previous_events{};
