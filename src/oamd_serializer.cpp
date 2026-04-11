@@ -19,21 +19,37 @@ namespace {
 
 constexpr gsize kMaxObjectCount = 159;
 constexpr gint8 kGainMinusInfinity = -128;
+// libdlb_oamdi.dylib .rodata @ 0x0000e720.
 constexpr std::array<guint8, 6> kISFCountList = {4, 8, 10, 14, 15, 30};
+// libdlb_oamdi.dylib .rodata @ 0x0000e8d0.
 constexpr std::array<guint16, 16> kRampDurationList = {
     32,   64,   128,  256,  320,  480,  1000, 1001,
     1024, 1600, 1601, 1602, 1920, 2000, 2002, 2048,
 };
+
+// In `dee_audio_filter_dthd.dylib`, the trim quantizer at offset `0x0009bff0` uses an explicit float trim table:
+//  `{3.0, 1.5, 0.75, 0.0, -0.75, -1.5, -3.0, -4.5, -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -15.0, -36.0}`.
+// The corresponding raw-code map at offset `0x0091ecc0` is
+//  `{0,1,2,3,16,4,5,6,7,8,9,10,11,12,13,14,15}`.
 constexpr std::array<double, 16> kTrimLut = {
     6.0,  3.0,  1.5,  0.75,  -0.75, -1.5,  -3.0,  -4.5,
-    -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -16.0, -36.0,
+    -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -15.0, -36.0,
 };
+
+// Derived from libdlb_oamdi.dylib .rodata @ 0x0000ee90, which
+// stores the special object-divergence codes {26, 29, 32, 63}. Resolving those
+// through the Q14 table at 0x0000ee10 yields {0x200c / 16384,
+// 0x26f2 / 16384, 0x2d1c / 16384, 0x4000 / 16384} =
+// {0.500732421875, 0.6085205078125, 0.704833984375, 1.0}.
 constexpr std::array<double, 4> kObjectDivTableTable = {
     0.500755,
     0.608529,
     0.704833,
     1.0,
 };
+// Derived from libdlb_oamdi.dylib .rodata @ 0x0000ee10, a Q14
+// lookup table. Decimal values below are rounded from the exact source entries
+// divided by 16384; index 0 remains reserved/null.
 constexpr std::array<std::optional<double>, 64> kObjectDivCodeTable = {
     std::nullopt, 0.0,      0.004026, 0.00716,  0.012731, 0.020173, 0.028485,
     0.04021,      0.050582, 0.063601, 0.079914, 0.100299, 0.125666, 0.140532,
@@ -46,6 +62,7 @@ constexpr std::array<std::optional<double>, 64> kObjectDivCodeTable = {
     0.98733,      0.989935, 0.992874, 0.994955, 0.996817, 0.99821,  0.998993,
     1.0,
 };
+// libdlb_oamdi.dylib .rodata @ 0x0000e880 as four int32 values {1, 2, -1, -2}.
 constexpr std::array<double, 4> kExtPrecPos3DLut = {1.0, 2.0, -1.0, -2.0};
 constexpr std::array<std::string_view, 6> kZoneLabels = {
     "all", "no back", "no sides", "center back", "screen only", "surround only",
