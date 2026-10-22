@@ -1,7 +1,5 @@
 # gst-plugin-oamd
 
-Works with [atmos_tools.py](https://gist.github.com/yuygfgg/8a2686b230b2919b1d59f88addd4b0f6)
-
 ## Build
 
 ```sh
