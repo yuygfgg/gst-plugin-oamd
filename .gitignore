@@ -2,3 +2,5 @@ build/
 .DS_Store
 third_party/*
 !third_party/.gitkeep
+__pycache__/
+*.pyc
